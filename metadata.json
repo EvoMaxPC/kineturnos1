@@ -1,0 +1,6 @@
+{
+  "name": "KineFlow AI - Gestión Kinesiológica",
+  "description": "Plataforma integral para kinesiólogos con motor Gemini AI: turnos por WhatsApp, ficha de pacientes, libro diario económico y supervisión de autonomía.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
