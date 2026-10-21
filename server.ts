@@ -37,11 +37,12 @@ import {
   generateDailyClinicalSummary,
   interpretPatientMessageSofi,
 } from './src/services/geminiService.ts';
+import { createWhatsAppWebhookRouter, sendWhatsAppText, type InboundWhatsAppText, type WhatsAppConfig } from './src/services/whatsappCloudApi.ts';
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '20mb' }));
+app.use(express.json({ limit: '20mb', verify: (req, _res, buf) => { (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf); } }));
 
 // In-Memory Reactive Store (State)
 let clinicConfig: ClinicConfig = { ...initialClinicConfig };
@@ -50,7 +51,132 @@ let appointments: Appointment[] = [...initialAppointments];
 let proposals: AIProposal[] = [...initialProposals];
 let transactions: PaymentTransaction[] = [...initialTransactions];
 let auditLogs: AuditLogItem[] = [...initialAuditLogs];
+
 let whatsappMessages: WhatsAppMessage[] = [...initialWhatsAppMessages];
+
+// WhatsApp Cloud API webhook. The simulator remains available for local/manual testing.
+const whatsappConfig: WhatsAppConfig = {
+  accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '',
+  phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || '',
+  verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || '',
+  appSecret: process.env.WHATSAPP_APP_SECRET || '',
+  graphApiVersion: process.env.WHATSAPP_GRAPH_API_VERSION || 'v23.0',
+};
+
+function normalizePhoneForMatch(value: string): string {
+  return value.replace(/\\D/g, '').slice(-10);
+}
+
+app.use('/webhook', createWhatsAppWebhookRouter(whatsappConfig, async (message: InboundWhatsAppText) => {
+  const normalizedSender = normalizePhoneForMatch(message.waId);
+  const matchingPatients = patients.filter((p) => normalizedSender.length === 10 && normalizePhoneForMatch(p.phone) === normalizedSender);
+
+  if (matchingPatients.length !== 1) {
+    const text = matchingPatients.length === 0
+      ? 'Hola. No pude asociar este número a una ficha de paciente. Por favor, comunicate con el consultorio para verificar tus datos.'
+      : 'Hola. Necesitamos verificar tus datos antes de gestionar turnos. Por favor, comunicate con el consultorio.';
+    try { await sendWhatsAppText(whatsappConfig, message.waId, text); }
+    catch (error) { console.error('[WhatsApp] No se pudo enviar respuesta de identificación:', error); }
+    return;
+  }
+
+  const patient = matchingPatients[0];
+  whatsappMessages.push({
+    id: message.messageId,
+    patientId: patient.id,
+    sender: 'patient',
+    type: 'text',
+    content: message.text,
+    timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+    status: 'read',
+  });
+
+  if (!message.text) return;
+  const interpretation = await interpretPatientMessageSofi({
+    message: message.text,
+    patient,
+    clinicConfig,
+    existingAppointments: appointments,
+    currentDateStr: todayStr,
+  });
+
+  let responseText = interpretation.patient_message || 'Recibí tu mensaje. El consultorio lo revisará.';
+  if (interpretation.intent !== 'MENSAJE_IGNORADO') {
+    const proposedDate = interpretation.proposed_slot?.date || tomorrowStr;
+    const proposedTime = interpretation.proposed_slot?.time || '16:00';
+    const endTime = getEndTime(proposedTime);
+    const area = 'Box 1 - Fisioterapia' as TreatmentArea;
+    const conflict = checkSlotConflict(
+      { date: proposedDate, startTime: proposedTime, endTime, area },
+      appointments,
+    );
+    const autonomy = determineAutonomyAction(
+      clinicConfig.autonomyLevel,
+      patient.currentTreatment.completedSessions > 0,
+      conflict.hasConflict,
+      true,
+    );
+
+    if (autonomy.action === 'auto_book') {
+      const booked: Appointment = {
+        id: 'app-wa-' + message.messageId,
+        patientId: patient.id,
+        patientName: patient.fullName,
+        patientPhone: patient.phone,
+        date: proposedDate,
+        startTime: proposedTime,
+        endTime,
+        area,
+        sessionNumber: patient.currentTreatment.completedSessions + 1,
+        totalSessions: patient.currentTreatment.totalSessions,
+        status: 'confirmed',
+        isPaid: false,
+        price: patient.insurance === 'Particular' ? clinicConfig.sessionPriceStandard : clinicConfig.sessionPriceInsurance,
+        notes: 'Turno gestionado por WhatsApp Cloud API',
+        aiSuggested: true,
+        aiReasoning: interpretation.internal_summary,
+      };
+      appointments.push(booked);
+    } else {
+      const proposal: AIProposal = {
+        id: 'prop-wa-' + message.messageId,
+        patientId: patient.id,
+        patientName: patient.fullName,
+        patientPhone: patient.phone,
+        incomingMessage: message.text,
+        isAudio: false,
+        proposedDate,
+        proposedTime,
+        proposedArea: area,
+        clinicalReasoning: interpretation.internal_summary,
+        conflictStatus: conflict.hasConflict ? 'requires_override' : 'no_conflict',
+        status: 'pending',
+        confidenceScore: interpretation.confidence_score || 0,
+        createdAt: new Date().toISOString(),
+      };
+      proposals.unshift(proposal);
+      responseText = conflict.hasConflict
+        ? 'Gracias por escribir. Ese horario parece ocupado; dejamos tu solicitud pendiente de revisión por el kinesiólogo y te confirmaremos una alternativa.'
+        : 'Recibimos tu solicitud de turno. Quedó pendiente de confirmación del consultorio; te avisaremos por este medio.';
+    }
+  }
+
+  try {
+    await sendWhatsAppText(whatsappConfig, message.waId, responseText);
+    whatsappMessages.push({
+      id: 'wa-out-' + message.messageId,
+      patientId: patient.id,
+      sender: 'clinic_ai',
+      type: 'text',
+      content: responseText,
+      timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+      status: 'sent',
+    });
+  } catch (error) {
+    console.error('[WhatsApp] No se pudo enviar respuesta:', error);
+  }
+}));
+
 
 // GET full state
 app.get('/api/state', (_req: Request, res: Response) => {
