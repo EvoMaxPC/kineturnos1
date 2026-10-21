@@ -37,12 +37,13 @@ import {
   generateDailyClinicalSummary,
   interpretPatientMessageSofi,
 } from './src/services/geminiService.ts';
-import { createWhatsAppWebhookRouter, sendWhatsAppText, type InboundWhatsAppText, type WhatsAppConfig } from './src/services/whatsappCloudApi.ts';
+import twilio from 'twilio';
 
 dotenv.config();
 
 const app = express();
-app.use(express.json({ limit: '20mb', verify: (req, _res, buf) => { (req as Request & { rawBody?: Buffer }).rawBody = Buffer.from(buf); } }));
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: false, limit: '1mb' }));
 
 // In-Memory Reactive Store (State)
 let clinicConfig: ClinicConfig = { ...initialClinicConfig };
@@ -54,129 +55,121 @@ let auditLogs: AuditLogItem[] = [...initialAuditLogs];
 
 let whatsappMessages: WhatsAppMessage[] = [...initialWhatsAppMessages];
 
-// WhatsApp Cloud API webhook. The simulator remains available for local/manual testing.
-const whatsappConfig: WhatsAppConfig = {
-  accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '',
-  phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || '',
-  verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || '',
-  appSecret: process.env.WHATSAPP_APP_SECRET || '',
-  graphApiVersion: process.env.WHATSAPP_GRAPH_API_VERSION || 'v23.0',
-};
-
-function normalizePhoneForMatch(value: string): string {
-  return value.replace(/\\D/g, '').slice(-10);
+// Twilio WhatsApp webhook. Configure TWILIO_WEBHOOK_URL con la URL HTTPS pública exacta.
+function xmlEscape(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
 }
 
-app.use('/webhook', createWhatsAppWebhookRouter(whatsappConfig, async (message: InboundWhatsAppText) => {
-  const normalizedSender = normalizePhoneForMatch(message.waId);
-  const matchingPatients = patients.filter((p) => normalizedSender.length === 10 && normalizePhoneForMatch(p.phone) === normalizedSender);
+function normalizePhoneForMatch(value: string): string {
+  // Twilio envía "whatsapp:+549..." y la ficha puede contener "+54 9 ...".
+  return value.replace(/\D/g, '');
+}
 
-  if (matchingPatients.length !== 1) {
-    const text = matchingPatients.length === 0
-      ? 'Hola. No pude asociar este número a una ficha de paciente. Por favor, comunicate con el consultorio para verificar tus datos.'
-      : 'Hola. Necesitamos verificar tus datos antes de gestionar turnos. Por favor, comunicate con el consultorio.';
-    try { await sendWhatsAppText(whatsappConfig, message.waId, text); }
-    catch (error) { console.error('[WhatsApp] No se pudo enviar respuesta de identificación:', error); }
+app.post('/webhook/twilio', async (req: Request, res: Response) => {
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const webhookUrl = process.env.TWILIO_WEBHOOK_URL;
+  const signature = req.header('X-Twilio-Signature') || '';
+
+  if (!authToken || !webhookUrl) {
+    console.error('[Twilio] Faltan TWILIO_AUTH_TOKEN o TWILIO_WEBHOOK_URL.');
+    res.status(503).type('text/plain').send('Webhook no configurado');
+    return;
+  }
+  if (!signature || !twilio.validateRequest(authToken, signature, webhookUrl, req.body)) {
+    res.status(403).type('text/plain').send('Firma de Twilio inválida');
     return;
   }
 
-  const patient = matchingPatients[0];
-  whatsappMessages.push({
-    id: message.messageId,
-    patientId: patient.id,
-    sender: 'patient',
-    type: 'text',
-    content: message.text,
-    timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-    status: 'read',
+  const from = String(req.body?.From || '');
+  const body = String(req.body?.Body || '').trim();
+  const messageId = String(req.body?.MessageSid || 'twilio-' + Date.now());
+  const senderNumber = from.replace(/^whatsapp:/i, '');
+  const normalizedSender = normalizePhoneForMatch(senderNumber);
+  // Evita asociar pacientes por últimos dígitos: se exige coincidencia internacional exacta.
+  const matchingPatients = patients.filter((p) => {
+    const patientPhone = normalizePhoneForMatch(p.phone);
+    return patientPhone.length >= 10 && patientPhone === normalizedSender;
   });
 
-  if (!message.text) return;
-  const interpretation = await interpretPatientMessageSofi({
-    message: message.text,
-    patient,
-    clinicConfig,
-    existingAppointments: appointments,
-    currentDateStr: todayStr,
-  });
-
-  let responseText = interpretation.patient_message || 'Recibí tu mensaje. El consultorio lo revisará.';
-  if (interpretation.intent !== 'MENSAJE_IGNORADO') {
-    const proposedDate = interpretation.proposed_slot?.date || tomorrowStr;
-    const proposedTime = interpretation.proposed_slot?.time || '16:00';
-    const endTime = getEndTime(proposedTime);
-    const area = 'Box 1 - Fisioterapia' as TreatmentArea;
-    const conflict = checkSlotConflict(
-      { date: proposedDate, startTime: proposedTime, endTime, area },
-      appointments,
-    );
-    const autonomy = determineAutonomyAction(
-      clinicConfig.autonomyLevel,
-      patient.currentTreatment.completedSessions > 0,
-      conflict.hasConflict,
-      true,
-    );
-
-    if (autonomy.action === 'auto_book') {
-      const booked: Appointment = {
-        id: 'app-wa-' + message.messageId,
-        patientId: patient.id,
-        patientName: patient.fullName,
-        patientPhone: patient.phone,
-        date: proposedDate,
-        startTime: proposedTime,
-        endTime,
-        area,
-        sessionNumber: patient.currentTreatment.completedSessions + 1,
-        totalSessions: patient.currentTreatment.totalSessions,
-        status: 'confirmed',
-        isPaid: false,
-        price: patient.insurance === 'Particular' ? clinicConfig.sessionPriceStandard : clinicConfig.sessionPriceInsurance,
-        notes: 'Turno gestionado por WhatsApp Cloud API',
-        aiSuggested: true,
-        aiReasoning: interpretation.internal_summary,
-      };
-      appointments.push(booked);
-    } else {
-      const proposal: AIProposal = {
-        id: 'prop-wa-' + message.messageId,
-        patientId: patient.id,
-        patientName: patient.fullName,
-        patientPhone: patient.phone,
-        incomingMessage: message.text,
-        isAudio: false,
-        proposedDate,
-        proposedTime,
-        proposedArea: area,
-        clinicalReasoning: interpretation.internal_summary,
-        conflictStatus: conflict.hasConflict ? 'requires_override' : 'no_conflict',
-        status: 'pending',
-        confidenceScore: interpretation.confidence_score || 0,
-        createdAt: new Date().toISOString(),
-      };
-      proposals.unshift(proposal);
-      responseText = conflict.hasConflict
-        ? 'Gracias por escribir. Ese horario parece ocupado; dejamos tu solicitud pendiente de revisión por el kinesiólogo y te confirmaremos una alternativa.'
-        : 'Recibimos tu solicitud de turno. Quedó pendiente de confirmación del consultorio; te avisaremos por este medio.';
-    }
-  }
-
+  let responseText = '';
   try {
-    await sendWhatsAppText(whatsappConfig, message.waId, responseText);
-    whatsappMessages.push({
-      id: 'wa-out-' + message.messageId,
-      patientId: patient.id,
-      sender: 'clinic_ai',
-      type: 'text',
-      content: responseText,
-      timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
-      status: 'sent',
-    });
-  } catch (error) {
-    console.error('[WhatsApp] No se pudo enviar respuesta:', error);
-  }
-}));
+    if (matchingPatients.length !== 1) {
+      responseText = matchingPatients.length === 0
+        ? 'Hola. No pude asociar este número a una ficha de paciente. Por favor, comunicate con el consultorio para verificar tus datos.'
+        : 'Hola. Necesitamos verificar tus datos antes de gestionar turnos. Por favor, comunicate con el consultorio.';
+    } else if (!body) {
+      responseText = 'Hola. Por ahora puedo procesar mensajes de texto. Escribime qué turno necesitás y te ayudo.';
+    } else {
+      const patient = matchingPatients[0];
+      whatsappMessages.push({
+        id: messageId,
+        patientId: patient.id,
+        sender: 'patient',
+        type: 'text',
+        content: body,
+        timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+        status: 'read',
+      });
 
+      const interpretation = await interpretPatientMessageSofi({
+        message: body,
+        patient,
+        clinicConfig,
+        existingAppointments: appointments,
+        currentDateStr: todayStr,
+      });
+      responseText = interpretation.patient_message || 'Recibí tu mensaje. El consultorio lo revisará.';
+
+      if (interpretation.intent === 'SOLICITAR_TURNO' && interpretation.proposed_slot) {
+        const proposedDate = interpretation.proposed_slot.date;
+        const proposedTime = interpretation.proposed_slot.time;
+        const endTime = getEndTime(proposedTime);
+        const area = 'Box 1 - Fisioterapia' as TreatmentArea;
+        const conflict = checkSlotConflict({ date: proposedDate, startTime: proposedTime, endTime, area }, appointments);
+        // En producción, los turnos quedan pendientes de aprobación del kinesiólogo.
+        const proposal: AIProposal = {
+          id: 'prop-wa-' + messageId,
+          patientId: patient.id,
+          patientName: patient.fullName,
+          patientPhone: patient.phone,
+          incomingMessage: body,
+          isAudio: false,
+          proposedDate,
+          proposedTime,
+          proposedArea: area,
+          clinicalReasoning: interpretation.internal_summary,
+          conflictStatus: conflict.hasConflict ? 'requires_override' : 'no_conflict',
+          status: 'pending',
+          confidenceScore: interpretation.confidence_score || 0,
+          createdAt: new Date().toISOString(),
+        };
+        proposals.unshift(proposal);
+        responseText = conflict.hasConflict
+          ? 'Gracias por escribir. Ese horario parece ocupado; dejamos tu solicitud pendiente de revisión por el kinesiólogo y te confirmaremos una alternativa.'
+          : 'Recibimos tu solicitud de turno. Quedó pendiente de confirmación del consultorio; te avisaremos por este medio.';
+      }
+
+      whatsappMessages.push({
+        id: 'wa-out-' + messageId,
+        patientId: patient.id,
+        sender: 'clinic_ai',
+        type: 'text',
+        content: responseText,
+        timestamp: new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' }),
+        status: 'sent',
+      });
+    }
+
+    const twiml = responseText
+      ? '<?xml version="1.0" encoding="UTF-8"?><Response><Message>' + xmlEscape(responseText) + '</Message></Response>'
+      : '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+    res.status(200).type('text/xml').send(twiml);
+  } catch (error) {
+    console.error('[Twilio] Error procesando mensaje entrante:', error);
+    // Twilio recibe una respuesta válida; no se expone información interna al usuario.
+    res.status(200).type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Message>Disculpá, hubo un inconveniente. El consultorio revisará tu mensaje y te responderá.</Message></Response>');
+  }
+});
 
 // GET full state
 app.get('/api/state', (_req: Request, res: Response) => {
