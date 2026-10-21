@@ -228,7 +228,7 @@ async function sendTwilioWhatsApp(toPhone: string, body: string): Promise<void> 
   if (!accountSid || !authToken || !from) {
     throw new Error('Faltan TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN o TWILIO_WHATSAPP_FROM');
   }
-  const to = 'whatsapp:' + toPhone.replace(/^whatsapp:/i, '').replace(/\\s/g, '');
+  const to = 'whatsapp:' + toPhone.replace(/^whatsapp:/i, '').replace(/\s/g, '');
   const client = twilio(accountSid, authToken);
   await client.messages.create({ from, to, body });
 }
