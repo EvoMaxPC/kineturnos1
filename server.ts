@@ -220,8 +220,21 @@ app.post('/api/patients/:id/evolution', (req: Request, res: Response) => {
   res.json({ success: true, patient, newEntry });
 });
 
+// Envío real de mensajes de WhatsApp mediante Twilio.
+async function sendTwilioWhatsApp(toPhone: string, body: string): Promise<void> {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const from = process.env.TWILIO_WHATSAPP_FROM;
+  if (!accountSid || !authToken || !from) {
+    throw new Error('Faltan TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN o TWILIO_WHATSAPP_FROM');
+  }
+  const to = 'whatsapp:' + toPhone.replace(/^whatsapp:/i, '').replace(/\\s/g, '');
+  const client = twilio(accountSid, authToken);
+  await client.messages.create({ from, to, body });
+}
+
 // POST Handle AI Proposal Action (Approve, Modify, Reject)
-app.post('/api/proposals/action', (req: Request, res: Response) => {
+app.post('/api/proposals/action', async (req: Request, res: Response) => {
   const { proposalId, action, finalDate, finalTime, finalArea, feedbackReason } = req.body;
   const proposal = proposals.find((p) => p.id === proposalId);
 
@@ -273,6 +286,18 @@ app.post('/api/proposals/action', (req: Request, res: Response) => {
       status: 'sent',
     };
     whatsappMessages.push(waReply);
+
+    // Enviar la confirmación real por WhatsApp. Si falla, conservar la propuesta
+    // y dejar el error registrado para que pueda corregirse la configuración.
+    try {
+      await sendTwilioWhatsApp(
+        proposal.patientPhone,
+        waReply.content,
+      );
+    } catch (error) {
+      console.error('[Twilio] No se pudo enviar la confirmación de turno:', error);
+      waReply.status = 'failed';
+    }
 
     // Registrar en auditoría de aprendizaje de la IA
     const auditItem: AuditLogItem = {
